@@ -1,0 +1,24 @@
+# Secrets — never commit real credentials or generated key material.
+.env
+
+# Generated TLS certificates and keys (run security/gen-certs.sh locally).
+security/*.crt
+security/*.key
+security/*.srl
+
+# Generated Mosquitto password file (run security/gen-passwd.sh locally).
+mqtt/passwd
+
+# Node
+**/node_modules
+
+# Runtime data / state
+mongo-data
+mqtt/data
+node-red/.config*
+node-red/.sessions*
+node-red/flows_cred.json
+
+# OS / editor
+.DS_Store
+**/.DS_Store

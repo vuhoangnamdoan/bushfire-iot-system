@@ -1,0 +1,14 @@
+{
+  "name": "shared",
+  "version": "1.0.0",
+  "description": "Shared MongoDB connection helper and Mongoose models for the bushfire cloud services.",
+  "main": "db.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "mongoose": "^9.9.4"
+  }
+}

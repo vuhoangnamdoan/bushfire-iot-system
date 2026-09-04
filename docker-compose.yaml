@@ -1,0 +1,132 @@
+# Bushfire Detection Monitoring System — local/dev stack.
+#
+# Layers:
+#   mosquitto  -> communication (MQTT broker)
+#   node-red   -> processing (clean/route/format)
+#   ingestion/detection/alert -> cloud microservices
+#   mongodb    -> database
+#
+# Services reach each other by their compose service name on the default
+# network (e.g. http://ingestion:4001, mongodb:27017, mosquitto:1883).
+# Ports are also published to the host for the sensor scripts and debugging.
+#
+# SECURITY (see README "Security"): every credential, token, and cert path below
+# comes from an environment variable — nothing is hardcoded. Copy .env.example
+# to .env and edit it. Defaults keep the stack OPEN (no auth, no TLS) so scaling
+# tests run unchanged; flip AUTH_ENABLED / TLS_ENABLED (and MOSQUITTO_CONF) on to
+# run secured.
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    # MOSQUITTO_CONF selects the config file inside /mosquitto/config:
+    #   mosquitto.dev.conf -> open (anonymous, 1883)          [default]
+    #   mosquitto.conf     -> secured (auth + TLS 8883)
+    command: ["mosquitto", "-c", "/mosquitto/config/${MOSQUITTO_CONF:-mosquitto.dev.conf}"]
+    ports:
+      - "1883:1883"
+      - "8883:8883"
+    volumes:
+      - ./mqtt:/mosquitto/config          # both configs + the passwd file
+      - ./security:/mosquitto/security:ro # TLS certs (ca.crt, broker.crt/.key)
+      - ./mqtt/data:/mosquitto/data       # persistence
+    restart: unless-stopped
+
+  mongodb:
+    # Pinned to 7.0: mongo 8.0/latest hard-block on Docker Desktop's Linux
+    # kernel 6.19+ (MongoDB SERVER-121912). 7.0 boots fine on this kernel.
+    image: mongo:7.0
+    # Published to the host for local dev only (the benchmark harness connects to
+    # localhost:27017). On AWS, MongoDB is NOT public — it stays on the internal
+    # network, reachable only by the services (see README "Security").
+    ports: ["27017:27017"]
+    volumes:
+      - ./mongo-data:/data/db
+    restart: unless-stopped
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/bushfire
+      PORT: "4001"
+      # REST API token auth (protects POST /api/sensor-data).
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      API_TOKEN: "${API_TOKEN:-}"
+    ports: ["4001:4001"]
+    depends_on: [mongodb]
+    restart: unless-stopped
+
+  alert:
+    build:
+      context: .
+      dockerfile: services/alert/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/bushfire
+      PORT: "4003"
+      # REST API token auth (protects POST /api/alert).
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      API_TOKEN: "${API_TOKEN:-}"
+      # Notifications: logging is always on. To also fan out via IFTTT Maker
+      # Webhooks, set these in .env (create a Webhooks applet first):
+      IFTTT_KEY: "${IFTTT_KEY:-}"
+      IFTTT_EVENT: "${IFTTT_EVENT:-bushfire_alert}"
+    ports: ["4003:4003"]
+    depends_on: [mongodb]
+    restart: unless-stopped
+
+  detection:
+    build:
+      context: .
+      dockerfile: services/detection/Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/bushfire
+      PORT: "4002"
+      ALERT_URL: http://alert:4003/api/alert
+      DROUGHT_FACTOR: "9"
+      RECENT_WINDOW_MIN: "10"
+      # REST API token auth: protects POST /api/detect AND is sent on the
+      # outbound call to the alert service.
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      API_TOKEN: "${API_TOKEN:-}"
+    ports: ["4002:4002"]
+    depends_on: [mongodb, alert]
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: services/dashboard/Dockerfile
+    environment:
+      PORT: "4004"
+      # mqtt://mosquitto:1883 (open/auth) or mqtts://mosquitto:8883 (TLS).
+      MQTT_URL: "${MQTT_URL:-mqtt://mosquitto:1883}"
+      INGESTION_URL: http://ingestion:4001
+      DROUGHT_FACTOR: "9"
+      # MQTT auth + TLS for the dashboard's broker subscription.
+      MQTT_USERNAME: "${MQTT_USERNAME:-}"
+      MQTT_PASSWORD: "${MQTT_PASSWORD:-}"
+      TLS_ENABLED: "${TLS_ENABLED:-false}"
+      MQTT_CA_FILE: /security/ca.crt
+    volumes:
+      - ./security:/security:ro           # CA cert for MQTTS (used when TLS on)
+    ports: ["4004:4004"]
+    depends_on: [mosquitto, ingestion]
+    restart: unless-stopped
+
+  node-red:
+    image: nodered/node-red:latest
+    environment:
+      # MQTT auth (broker node reads ${MQTT_USERNAME}/${MQTT_PASSWORD}).
+      MQTT_USERNAME: "${MQTT_USERNAME:-}"
+      MQTT_PASSWORD: "${MQTT_PASSWORD:-}"
+      # REST API token auth for the HTTP request nodes -> ingestion/detection.
+      AUTH_ENABLED: "${AUTH_ENABLED:-false}"
+      API_TOKEN: "${API_TOKEN:-}"
+    ports: ["1880:1880"]
+    volumes:
+      - ./node-red:/data
+      - ./security:/security:ro           # CA cert for MQTTS (if enabled)
+    depends_on: [mosquitto, ingestion, detection]
+    restart: unless-stopped

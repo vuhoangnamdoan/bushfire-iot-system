@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bushfire Fleet — Live Dashboard</title>
+
+  <!-- Leaflet (map) + Chart.js (charts) + Socket.IO (live map stream), all CDN. -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <!-- date adapter: required by Chart.js "time" scale (bundle includes date-fns) -->
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+
+  <style>
+    :root {
+      --low: #2ecc71; --moderate: #f1c40f; --high: #e67e22; --critical: #e74c3c;
+      --panel-bg: #1e1e24; --panel-fg: #f5f5f7; --muted: #9aa0a6; --card: #26262e;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display: flex; height: 100vh; width: 100vw; }
+    #map { flex: 1; height: 100%; }
+
+    #panel {
+      width: 0; overflow: hidden; background: var(--panel-bg); color: var(--panel-fg);
+      transition: width 0.2s ease; display: flex; flex-direction: column;
+    }
+    #panel.open { width: 900px; }
+    @media (max-width: 1100px) { #panel.open { width: 55%; } }
+    @media (max-width: 800px) { #panel.open { width: 100%; } }
+
+    #panel-header {
+      padding: 14px 18px; border-bottom: 1px solid #34343c;
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+    }
+    #panel-title { font-size: 18px; font-weight: 700; }
+    #panel-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+    #close-btn { background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; line-height: 1; }
+
+    #panel-body { flex: 1; overflow-y: auto; padding: 12px 18px 22px; }
+    #latest {
+      font-size: 12px; color: var(--muted); background: var(--card);
+      border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
+    }
+    #latest b { color: var(--panel-fg); font-weight: 600; }
+
+    .chart-card { background: var(--card); border-radius: 8px; padding: 8px 12px 10px; margin-bottom: 12px; }
+    .chart-card h3 { margin: 2px 0 6px; font-size: 13px; font-weight: 600; color: var(--panel-fg); }
+    .chart-card .canvas-wrap { position: relative; height: 150px; }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+             font-weight: 700; text-transform: uppercase; color: #111; }
+    .badge.low { background: var(--low); }
+    .badge.moderate { background: var(--moderate); }
+    .badge.high { background: var(--high); color: #fff; }
+    .badge.critical { background: var(--critical); color: #fff; }
+
+    .legend {
+      position: absolute; bottom: 18px; left: 12px; z-index: 1000;
+      background: rgba(255,255,255,0.95); padding: 8px 10px; border-radius: 8px;
+      font-size: 12px; box-shadow: 0 1px 6px rgba(0,0,0,0.3);
+    }
+    .legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+    .legend .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="map">
+      <div class="legend">
+        <div style="font-weight:600;margin-bottom:4px">Severity</div>
+        <div class="row"><span class="dot" style="background:var(--low)"></span> low</div>
+        <div class="row"><span class="dot" style="background:var(--moderate)"></span> moderate</div>
+        <div class="row"><span class="dot" style="background:var(--high)"></span> high</div>
+        <div class="row"><span class="dot" style="background:var(--critical)"></span> critical</div>
+      </div>
+    </div>
+
+    <div id="panel">
+      <div id="panel-header">
+        <div>
+          <div id="panel-title">—</div>
+          <div id="panel-sub"></div>
+        </div>
+        <button id="close-btn" title="Close">&times;</button>
+      </div>
+      <div id="panel-body">
+        <div id="latest"></div>
+        <!-- five chart cards injected here -->
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ---- Config -------------------------------------------------------------
+    const SEVERITY_COLOR = {
+      low: getVar("--low"), moderate: getVar("--moderate"),
+      high: getVar("--high"), critical: getVar("--critical"),
+    };
+    function getVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+    // Human-readable names for each forest region (keyed by the region slug the
+    // sensors publish).
+    const FOREST_NAMES = {
+      otway:         "Great Otway National Park",
+      grampians:     "Grampians (Gariwerd) National Park",
+      alpine:        "Alpine National Park",
+      wilsons_prom:  "Wilsons Promontory National Park",
+      kinglake:      "Kinglake National Park",
+      yarra_ranges:  "Yarra Ranges National Park",
+      mt_buffalo:    "Mount Buffalo National Park",
+      errinundra:    "Errinundra National Park",
+      croajingolong: "Croajingolong National Park",
+      dandenong:     "Dandenong Ranges National Park",
+    };
+    function forestName(region) { return FOREST_NAMES[region] || region || "Unknown"; }
+
+    // Five metrics, each its own chart plotting the RAW value (no normalization).
+    const METRICS = [
+      { key: "temperature", title: "Temperature", unit: "°C",   color: "#e74c3c", get: (r) => r.readings && r.readings.temperature },
+      { key: "humidity",    title: "Humidity",    unit: "%",    color: "#3498db", get: (r) => r.readings && r.readings.humidity },
+      { key: "windSpeed",   title: "Wind speed",  unit: "km/h", color: "#1abc9c", get: (r) => r.readings && r.readings.windSpeed },
+      { key: "smokeLevel",  title: "Smoke level", unit: "ppm",  color: "#9b59b6", get: (r) => r.readings && r.readings.smokeLevel },
+      { key: "ffdiScore",   title: "FFDI",        unit: "",     color: "#f39c12", get: (r) => r.ffdiScore },
+    ];
+
+    // ---- Map (live) ---------------------------------------------------------
+    const map = L.map("map").setView([-37.4, 145.6], 7); // Victoria
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    const markers = new Map(); // nodeId -> L.circleMarker
+    let boundsFitted = false;
+
+    function markerStyle(severity) {
+      return {
+        radius: 8, weight: 1.5, color: "#fff",
+        fillColor: SEVERITY_COLOR[severity] || "#888", fillOpacity: 0.9,
+      };
+    }
+
+    function upsertMarker(reading) {
+      const loc = reading.location;
+      if (!loc || loc.latitude == null || loc.longitude == null) return;
+      const id = reading.nodeId;
+      let m = markers.get(id);
+      if (!m) {
+        m = L.circleMarker([loc.latitude, loc.longitude], markerStyle(reading.severity));
+        m.addTo(map);
+        m.on("click", () => selectNode(id));
+        markers.set(id, m);
+        if (!boundsFitted) setTimeout(fitToMarkers, 400);
+      } else {
+        m.setStyle(markerStyle(reading.severity));
+        m.setLatLng([loc.latitude, loc.longitude]);
+      }
+      m.bindTooltip(
+        `${id} · ${forestName(reading.region)} · ${reading.severity} (FFDI ${reading.ffdiScore})`,
+        { direction: "top" }
+      );
+    }
+
+    function fitToMarkers() {
+      if (!markers.size) return;
+      const group = L.featureGroup(Array.from(markers.values()));
+      map.fitBounds(group.getBounds().pad(0.2));
+      boundsFitted = true;
+    }
+
+    // ---- Charts (snapshot on open, NOT live) --------------------------------
+    const charts = []; // one Chart per metric, built lazily
+
+    function buildCharts() {
+      const body = document.getElementById("panel-body");
+      METRICS.forEach((metric, i) => {
+        const card = document.createElement("div");
+        card.className = "chart-card";
+        card.innerHTML =
+          `<h3>${metric.title}${metric.unit ? " (" + metric.unit + ")" : ""}</h3>` +
+          `<div class="canvas-wrap"><canvas id="chart-${metric.key}"></canvas></div>`;
+        body.appendChild(card);
+
+        const ctx = card.querySelector("canvas").getContext("2d");
+        charts[i] = new Chart(ctx, {
+          type: "line",
+          data: {
+            datasets: [{
+              label: metric.title,
+              borderColor: metric.color,
+              backgroundColor: metric.color,
+              borderWidth: 2,
+              pointRadius: 3,          // a dot for every data point
+              pointHoverRadius: 5,
+              tension: 0.2,
+              data: [],                // {x: ms, y: rawValue}
+            }],
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            interaction: { mode: "index", intersect: false },
+            scales: {
+              x: {
+                type: "time",
+                time: { tooltipFormat: "HH:mm:ss", displayFormats: { second: "HH:mm:ss", minute: "HH:mm" } },
+                ticks: { color: "#9aa0a6", maxRotation: 0, autoSkip: true, maxTicksLimit: 6 },
+                grid: { color: "#2c2c34" },
+              },
+              y: {
+                title: { display: !!metric.unit, text: metric.unit, color: "#9aa0a6" },
+                ticks: { color: "#9aa0a6" },
+                grid: { color: "#2c2c34" },
+              },
+            },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: (item) => {
+                    const v = item.parsed.y;
+                    return `${metric.title}: ${v == null ? "—" : v}${metric.unit ? " " + metric.unit : ""}`;
+                  },
+                },
+              },
+            },
+          },
+        });
+      });
+    }
+
+    function tsMs(reading) { return new Date(reading.timestamp || Date.now()).getTime(); }
+
+    // Render a node's history into the five charts as a one-off snapshot.
+    function renderSnapshot(readings) {
+      METRICS.forEach((metric, i) => {
+        charts[i].data.datasets[0].data = readings.map((r) => {
+          const v = metric.get(r);
+          return { x: tsMs(r), y: v == null ? null : v };
+        });
+        charts[i].update("none");
+      });
+    }
+
+    function renderLatest(reading) {
+      const el = document.getElementById("latest");
+      if (!reading) { el.innerHTML = "No readings yet for this node."; return; }
+      const r = reading.readings || {};
+      const when = new Date(reading.timestamp || Date.now()).toLocaleTimeString();
+      el.innerHTML =
+        `<b>Latest reading</b> @ ${when} &nbsp; ` +
+        `<span class="badge ${reading.severity}">${reading.severity}</span><br>` +
+        `FFDI <b>${reading.ffdiScore}</b> · ` +
+        `temp <b>${fmt(r.temperature)}°C</b> · hum <b>${fmt(r.humidity)}%</b> · ` +
+        `wind <b>${fmt(r.windSpeed)}km/h</b> · smoke <b>${fmt(r.smokeLevel)}ppm</b>`;
+    }
+    function fmt(v) { return v == null ? "—" : v; }
+
+    async function selectNode(nodeId) {
+      document.getElementById("panel").classList.add("open");
+      document.getElementById("panel-title").textContent = nodeId;
+      document.getElementById("panel-sub").textContent = "loading…";
+      if (!charts.length) buildCharts();
+
+      try {
+        const res = await fetch(`/api/history?nodeId=${encodeURIComponent(nodeId)}`);
+        const body = await res.json();
+        const readings = body.readings || []; // oldest-first from the server
+        renderSnapshot(readings);
+        const latest = readings.length ? readings[readings.length - 1] : null;
+        renderLatest(latest);
+        const region = latest ? latest.region : "";
+        const stamp = new Date().toLocaleTimeString();
+        document.getElementById("panel-sub").textContent =
+          `${forestName(region)} · ${readings.length} readings · snapshot @ ${stamp}`;
+      } catch (e) {
+        document.getElementById("panel-sub").textContent = "history unavailable";
+        renderLatest(null);
+      }
+    }
+
+    document.getElementById("close-btn").addEventListener("click", () => {
+      document.getElementById("panel").classList.remove("open");
+      setTimeout(() => map.invalidateSize(), 250);
+    });
+
+    // ---- Live stream: updates the MAP only (charts are a snapshot on open) ---
+    const socket = io();
+    socket.on("connect", () => console.log("[dashboard] socket connected"));
+    socket.on("reading", (reading) => upsertMarker(reading));
+
+    // ---- First paint --------------------------------------------------------
+    (async function init() {
+      try {
+        const res = await fetch("/api/nodes");
+        const nodes = await res.json();
+        nodes.forEach(upsertMarker);
+        fitToMarkers();
+      } catch (e) {
+        console.error("initial /api/nodes failed", e);
+      }
+    })();
+  </script>
+</body>
+</html>

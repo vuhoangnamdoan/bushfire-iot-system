@@ -1,0 +1,217 @@
+[
+    {
+        "id": "flow_bushfire",
+        "type": "tab",
+        "label": "Bushfire Processing",
+        "disabled": false,
+        "info": "Processing layer: subscribe to MQTT sensor readings, clean/validate, format, then POST to the ingestion service and route risky readings to detection.",
+        "env": []
+    },
+    {
+        "id": "broker_mosquitto",
+        "type": "mqtt-broker",
+        "name": "mosquitto",
+        "broker": "mosquitto",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "credentials": {
+            "user": "${MQTT_USERNAME}",
+            "password": "${MQTT_PASSWORD}"
+        }
+    },
+    {
+        "id": "mqtt_in",
+        "type": "mqtt in",
+        "z": "flow_bushfire",
+        "name": "sensor readings",
+        "topic": "+/+/readings",
+        "qos": "0",
+        "datatype": "utf8",
+        "broker": "broker_mosquitto",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 130,
+        "y": 120,
+        "wires": [
+            [
+                "fn_clean"
+            ]
+        ]
+    },
+    {
+        "id": "fn_clean",
+        "type": "function",
+        "z": "flow_bushfire",
+        "name": "clean & validate",
+        "func": "// Parse, validate, and de-duplicate raw sensor readings.\n// Output 1 = clean reading, Output 2 = dropped reading (for the debug sidebar).\nlet data;\ntry {\n    data = typeof msg.payload === \"string\" ? JSON.parse(msg.payload) : msg.payload;\n} catch (e) {\n    return [null, { payload: { reason: \"invalid_json\", raw: msg.payload } }];\n}\n\nif (!data || !data.nodeId || !data.region || !data.readings) {\n    return [null, { payload: { reason: \"missing_fields\", data } }];\n}\n\n// Physically valid range per sensor. Anything outside = dropout/stuck/spike fault.\nconst ranges = {\n    temperature: [-10, 80],\n    humidity: [0, 100],\n    windSpeed: [0, 150],\n    smokeLevel: [0, 2000],\n};\nfor (const k of Object.keys(ranges)) {\n    const [lo, hi] = ranges[k];\n    const v = data.readings[k];\n    if (typeof v !== \"number\" || !isFinite(v) || v < lo || v > hi) {\n        return [null, { payload: { reason: \"invalid_\" + k, value: v, nodeId: data.nodeId } }];\n    }\n}\n\n// De-duplicate exact re-deliveries (same node + timestamp) seen in the last 60s.\nconst seen = flow.get(\"seen\") || {};\nconst key = data.nodeId + \"|\" + data.timestamp;\nconst now = Date.now();\nif (seen[key]) {\n    return [null, { payload: { reason: \"duplicate\", key } }];\n}\nseen[key] = now;\nfor (const k of Object.keys(seen)) {\n    if (now - seen[k] > 60000) delete seen[k];\n}\nflow.set(\"seen\", seen);\n\nmsg.payload = data;\nreturn [msg, null];",
+        "outputs": 2,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 340,
+        "y": 120,
+        "wires": [
+            [
+                "fn_format"
+            ],
+            [
+                "dbg_dropped"
+            ]
+        ]
+    },
+    {
+        "id": "fn_format",
+        "type": "function",
+        "z": "flow_bushfire",
+        "name": "format",
+        "func": "// Standardise structure and timestamp before forwarding to the cloud services.\nconst d = msg.payload;\nmsg.payload = {\n    nodeId: d.nodeId,\n    region: d.region,\n    timestamp: d.timestamp ? new Date(d.timestamp).toISOString() : new Date().toISOString(),\n    location: d.location || null,\n    readings: {\n        temperature: d.readings.temperature,\n        humidity: d.readings.humidity,\n        windSpeed: d.readings.windSpeed,\n        smokeLevel: d.readings.smokeLevel,\n    },\n};\n\n// REST token auth: attach a bearer token to the ingestion/detection calls when\n// AUTH_ENABLED=true. The header flows on to http_detect via fn_route as well.\nconst headers = { \"Content-Type\": \"application/json\" };\nif (String(env.get(\"AUTH_ENABLED\") || \"\").toLowerCase() === \"true\" && env.get(\"API_TOKEN\")) {\n    headers[\"Authorization\"] = \"Bearer \" + env.get(\"API_TOKEN\");\n}\nmsg.headers = headers;\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 540,
+        "y": 100,
+        "wires": [
+            [
+                "http_ingest",
+                "fn_route"
+            ]
+        ]
+    },
+    {
+        "id": "http_ingest",
+        "type": "http request",
+        "z": "flow_bushfire",
+        "name": "POST ingestion",
+        "method": "POST",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "http://ingestion:4001/api/sensor-data",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 760,
+        "y": 80,
+        "wires": [
+            [
+                "dbg_ingest"
+            ]
+        ]
+    },
+    {
+        "id": "fn_route",
+        "type": "function",
+        "z": "flow_bushfire",
+        "name": "route if risky",
+        "func": "// Route risky readings (elevated smoke) to the detection service as well.\n// Every reading still goes to ingestion; only these also go to /api/detect.\nconst SMOKE_ELEVATED = 150; // ppm  (keep in sync with detection SMOKE_ELEVATED_PPM)\nif ((msg.payload.readings.smokeLevel || 0) >= SMOKE_ELEVATED) {\n    return msg;\n}\nreturn null;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 550,
+        "y": 180,
+        "wires": [
+            [
+                "http_detect"
+            ]
+        ]
+    },
+    {
+        "id": "http_detect",
+        "type": "http request",
+        "z": "flow_bushfire",
+        "name": "POST detection",
+        "method": "POST",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "http://detection:4002/api/detect",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 760,
+        "y": 180,
+        "wires": [
+            [
+                "dbg_detect"
+            ]
+        ]
+    },
+    {
+        "id": "dbg_ingest",
+        "type": "debug",
+        "z": "flow_bushfire",
+        "name": "ingest resp",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 970,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "dbg_detect",
+        "type": "debug",
+        "z": "flow_bushfire",
+        "name": "detect resp",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 970,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "dbg_dropped",
+        "type": "debug",
+        "z": "flow_bushfire",
+        "name": "dropped",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload.reason",
+        "statusType": "msg",
+        "x": 550,
+        "y": 260,
+        "wires": []
+    }
+]

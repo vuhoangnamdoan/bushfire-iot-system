@@ -1,0 +1,21 @@
+# Keep build contexts small and avoid copying host (macOS) node_modules into
+# the Linux images. Dependencies are installed inside each Dockerfile instead.
+**/node_modules
+mongo-data
+mqtt/data
+node-red/.config*
+node-red/.sessions*
+node-red/node_modules
+weather-simulator-master
+*.pdf
+.git
+.DS_Store
+**/.DS_Store
+
+# Secrets and generated key material must never be baked into images. The
+# broker reads certs/passwd from mounted volumes at runtime instead.
+.env
+security/*.key
+security/*.crt
+security/*.srl
+mqtt/passwd
