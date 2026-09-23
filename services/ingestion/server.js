@@ -10,6 +10,9 @@ app.use(express.json({ limit: "1mb" }));
 // Liveness probe is intentionally left OPEN (no token) for the load balancer.
 app.get("/health", (req, res) => res.json({ status: "ok", service: "ingestion" }));
 
+const os = require("os");
+app.get("/whoami", (req, res) => res.json({ instance: os.hostname() }));
+
 // Basic guard so a malformed message can't poison the collection.
 function validateReading(body) {
   if (!body || typeof body !== "object") return "body must be a JSON object";
