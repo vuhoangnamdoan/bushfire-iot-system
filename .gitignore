@@ -1,5 +1,7 @@
 # Secrets — never commit real credentials or generated key material.
 .env
+# Local Compose override holding real MongoDB Atlas credentials.
+docker-compose.local.yaml
 
 # Generated TLS certificates and keys (run security/gen-certs.sh locally).
 security/*.crt
@@ -13,7 +15,7 @@ mqtt/passwd
 **/node_modules
 
 # Runtime data / state
-mongo-data
+mongo-data*
 mqtt/data
 node-red/.config*
 node-red/.sessions*
@@ -22,3 +24,9 @@ node-red/flows_cred.json
 # OS / editor
 .DS_Store
 **/.DS_Store
+out/
+**.drawio
+**.svg
+**.pdf
+**.docx
+__pycache__/

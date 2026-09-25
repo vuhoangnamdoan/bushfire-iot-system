@@ -32,6 +32,49 @@ services:
       - ./mqtt/data:/mosquitto/data       # persistence
     restart: unless-stopped
 
+  # Redpanda: Kafka-API-compatible streaming broker that sits between the MQTT
+  # broker and the services. It buffers bursts durably and lets consumers scale
+  # horizontally. Only starts under the "queue" profile (the HD experiment):
+  #   COMPOSE_PROFILES=queue KAFKA_ENABLED=true docker compose up --build
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    profiles: ["queue"]
+    command:
+      - redpanda start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"   # host access (rpk / debugging) — services use redpanda:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # MQTT -> Kafka bridge. Replaces Node-RED on the hot path. Queue profile only.
+  bridge:
+    build:
+      context: .
+      dockerfile: services/bridge/Dockerfile
+    profiles: ["queue"]
+    environment:
+      MQTT_URL: "${MQTT_URL:-mqtt://mosquitto:1883}"
+      MQTT_USERNAME: "${MQTT_USERNAME:-}"
+      MQTT_PASSWORD: "${MQTT_PASSWORD:-}"
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_TOPIC: "sensor-readings"
+      KAFKA_PARTITIONS: "${KAFKA_PARTITIONS:-12}"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
   mongodb:
     # Pinned to 7.0: mongo 8.0/latest hard-block on Docker Desktop's Linux
     # kernel 6.19+ (MongoDB SERVER-121912). 7.0 boots fine on this kernel.
@@ -41,7 +84,12 @@ services:
     # network, reachable only by the services (see README "Security").
     ports: ["27017:27017"]
     volumes:
-      - ./mongo-data:/data/db
+      # Docker-managed named volume (declared at the bottom of this file) rather
+      # than a host bind mount. Bind-mounting into a synced macOS folder
+      # (Documents/iCloud) caused WiredTiger "Operation not permitted" on the
+      # data files. A named volume keeps the DB inside Docker, away from host
+      # permission issues.
+      - mongo-data:/data/db
     restart: unless-stopped
 
   ingestion:
@@ -54,6 +102,13 @@ services:
       # REST API token auth (protects POST /api/sensor-data).
       AUTH_ENABLED: "${AUTH_ENABLED:-false}"
       API_TOKEN: "${API_TOKEN:-}"
+      # Kafka/Redpanda consumer. KAFKA_ENABLED=true switches the write path from
+      # HTTP (Node-RED) to consuming the "sensor-readings" topic in batches.
+      KAFKA_ENABLED: "${KAFKA_ENABLED:-false}"
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_TOPIC: "sensor-readings"
+      KAFKA_PARTITIONS: "${KAFKA_PARTITIONS:-12}"
+      KAFKA_GROUP: "ingestion"
     ports: ["4001:4001"]
     depends_on: [mongodb]
     restart: unless-stopped
@@ -90,6 +145,11 @@ services:
       # outbound call to the alert service.
       AUTH_ENABLED: "${AUTH_ENABLED:-false}"
       API_TOKEN: "${API_TOKEN:-}"
+      # Kafka/Redpanda consumer (own group). When on, detection also consumes the
+      # "sensor-readings" topic in parallel with ingestion (pub/sub fan-out).
+      KAFKA_ENABLED: "${KAFKA_ENABLED:-false}"
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_TOPIC: "sensor-readings"
     ports: ["4002:4002"]
     depends_on: [mongodb, alert]
     restart: unless-stopped
@@ -115,8 +175,13 @@ services:
     depends_on: [mosquitto, ingestion]
     restart: unless-stopped
 
+  # Node-RED is the ORIGINAL processing tier (the 6.3D bottleneck). It is now
+  # behind the "legacy" profile so it never runs at the same time as the queue
+  # path (that would double-write). Legacy/before run:
+  #   COMPOSE_PROFILES=legacy docker compose up --build
   node-red:
     image: nodered/node-red:latest
+    profiles: ["legacy"]
     environment:
       # MQTT auth (broker node reads ${MQTT_USERNAME}/${MQTT_PASSWORD}).
       MQTT_USERNAME: "${MQTT_USERNAME:-}"
@@ -130,3 +195,7 @@ services:
       - ./security:/security:ro           # CA cert for MQTTS (if enabled)
     depends_on: [mosquitto, ingestion, detection]
     restart: unless-stopped
+
+# Docker-managed named volumes (avoids host/iCloud bind-mount permission issues).
+volumes:
+  mongo-data:

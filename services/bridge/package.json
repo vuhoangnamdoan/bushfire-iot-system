@@ -1,0 +1,15 @@
+{
+  "name": "bridge",
+  "version": "1.0.0",
+  "description": "MQTT to Kafka/Redpanda bridge for the bushfire ingestion pipeline.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "mqtt": "^5.15.2"
+  }
+}

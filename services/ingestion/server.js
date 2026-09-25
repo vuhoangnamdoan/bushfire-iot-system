@@ -3,6 +3,11 @@ const { connectDB, Reading } = require("../../shared/db");
 const { requireApiToken } = require("../../shared/auth");
 
 const PORT = Number(process.env.PORT || 4001);
+// When true, this service also runs a Kafka consumer that writes readings from
+// the "sensor-readings" topic. The HTTP POST /api/sensor-data path stays for
+// backward compatibility (and the old Node-RED stack); the query API and health
+// endpoint always run either way.
+const KAFKA_ENABLED = String(process.env.KAFKA_ENABLED || "false").toLowerCase() === "true";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -73,6 +78,13 @@ app.get("/api/readings", async (req, res) => {
 async function start() {
   await connectDB();
   app.listen(PORT, () => console.log(`[ingestion] listening on :${PORT}`));
+
+  if (KAFKA_ENABLED) {
+    const { startConsumer } = require("./consumer");
+    await startConsumer();
+  } else {
+    console.log("[ingestion] KAFKA_ENABLED=false — HTTP write path only (legacy/Node-RED mode)");
+  }
 }
 
 start().catch((e) => {

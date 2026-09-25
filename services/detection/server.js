@@ -107,9 +107,18 @@ app.post("/api/detect", requireApiToken(), async (req, res) => {
   }
 });
 
+const KAFKA_ENABLED = String(process.env.KAFKA_ENABLED || "false").toLowerCase() === "true";
+
 async function start() {
   await connectDB();
   app.listen(PORT, () => console.log(`[detection] listening on :${PORT} (alert -> ${ALERT_URL})`));
+
+  if (KAFKA_ENABLED) {
+    const { startConsumer } = require("./consumer");
+    await startConsumer();
+  } else {
+    console.log("[detection] KAFKA_ENABLED=false — HTTP /api/detect path only (legacy/Node-RED mode)");
+  }
 }
 
 start().catch((e) => {

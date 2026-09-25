@@ -17,6 +17,65 @@ docker compose up --build
 
 ---
 
+## HD (6.4HD): Redpanda queue pipeline
+
+The 6.3D benchmarks showed the single-threaded **Node-RED** processing tier is
+the scaling bottleneck (0% loss up to ~200 msg/s, then 85% loss at 5000 nodes,
+99% beyond, while ingestion and MongoDB stay idle). The HD work applies a
+state-of-the-art fix: put a durable, Kafka-compatible **Redpanda** queue between
+the broker and the services, so ingestion is buffered and consumed in parallel
+instead of funnelling through one process.
+
+```
+BEFORE:  sensors ─MQTT─▶ Mosquitto ─▶ Node-RED ─HTTP(1 write/msg)─▶ ingestion ─▶ MongoDB
+AFTER:   sensors ─MQTT─▶ Mosquitto ─▶ bridge ─▶ Redpanda ─▶ ingestion consumers (batch insert) ─▶ MongoDB
+                                                        └▶ detection consumer ─▶ alert
+```
+
+What changed:
+- **`services/bridge`** — thin MQTT→Kafka bridge (keys each message by nodeId, batches to Redpanda). Does almost no per-message work, so it is not a bottleneck.
+- **`services/ingestion/consumer.js`** — consumes the `sensor-readings` topic in the `ingestion` group and writes with batched `insertMany`. Scale it out with `--scale ingestion=N` (up to `KAFKA_PARTITIONS`).
+- **`services/detection/consumer.js`** — consumes the same topic in its own group (pub/sub fan-out), applies the smoke pre-filter, then the existing FFDI rule.
+- **`shared/processing.js`** — the clean/validate/format logic, ported verbatim from the Node-RED function nodes so the two pipelines do equivalent work.
+- Node-RED moved behind the `legacy` profile; Redpanda + bridge are under the `queue` profile, so the two write paths never run together.
+
+### Run the two modes
+
+```bash
+# BEFORE (Node-RED path) — reproduces the 6.3D baseline
+COMPOSE_PROFILES=legacy docker compose up --build
+
+# AFTER (Redpanda queue path)
+COMPOSE_PROFILES=queue KAFKA_ENABLED=true docker compose up --build
+```
+
+### Reproduce the experiment
+
+```bash
+# 1. bring up the queue stack
+COMPOSE_PROFILES=queue KAFKA_ENABLED=true docker compose up -d --build
+
+# 2. run the ramp (same steps as the 6.3D plan1 run)
+cd benchmarks
+STEPS=300,500,1000,5000,10000 HOLD_SEC=300 INTERVAL_MS=5000 node plan1_queue_throughput.js
+
+# 3. draw before/after charts + table (needs plan1_results.json from 6.3D)
+python3 plot_compare.py     # -> out/compare_loss.png, compare_latency.png, compare_table.md
+
+# 4. (optional) show horizontal scaling: rerun step 2 with more consumers
+COMPOSE_PROFILES=queue KAFKA_ENABLED=true \
+  docker compose -f docker-compose.yaml -f docker-compose.scale.yaml \
+  up -d --build --scale ingestion=3
+```
+
+Local logic tests (no Docker needed):
+
+```bash
+node shared/processing.test.js
+```
+
+---
+
 ## Security
 
 | Control | What it protects | Flag | Off (default) | On |

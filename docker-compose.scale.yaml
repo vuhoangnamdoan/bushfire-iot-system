@@ -1,0 +1,14 @@
+# Override used only for the horizontal-scaling run of the ingestion consumer.
+#
+#   COMPOSE_PROFILES=queue KAFKA_ENABLED=true \
+#     docker compose -f docker-compose.yaml -f docker-compose.scale.yaml \
+#     up -d --build --scale ingestion=3
+#
+# In queue mode the ingestion service takes its work from Redpanda, not from an
+# inbound HTTP port, so it does not need a published host port. Clearing the port
+# mapping lets several replicas run at once (a fixed "4001:4001" would collide).
+# `!reset` needs Docker Compose v2.24+. On older Compose, instead comment out the
+# `ports: ["4001:4001"]` line in docker-compose.yaml for the scaling run.
+services:
+  ingestion:
+    ports: !reset []
