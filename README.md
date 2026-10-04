@@ -8,6 +8,8 @@ sensors ──MQTT──▶ Mosquitto ──▶ Node-RED ──HTTP──▶ ing
                      │                    └─HTTP──▶ detection ──▶ alert ──▶ (IFTTT/log)
                      └────────────────────────────▶ dashboard (live map)
 ```
+<img width="1072" height="301" alt="Screenshot 2026-09-04 at 16 57 16" src="https://github.com/user-attachments/assets/8176efb8-ae64-4506-aeb3-1df47f37401e" />
+
 
 Run the whole stack with Docker Compose:
 
@@ -26,11 +28,7 @@ state-of-the-art fix: put a durable, Kafka-compatible **Redpanda** queue between
 the broker and the services, so ingestion is buffered and consumed in parallel
 instead of funnelling through one process.
 
-```
-BEFORE:  sensors ─MQTT─▶ Mosquitto ─▶ Node-RED ─HTTP(1 write/msg)─▶ ingestion ─▶ MongoDB
-AFTER:   sensors ─MQTT─▶ Mosquitto ─▶ bridge ─▶ Redpanda ─▶ ingestion consumers (batch insert) ─▶ MongoDB
-                                                        └▶ detection consumer ─▶ alert
-```
+<img width="1011" height="260" alt="ab" src="https://github.com/user-attachments/assets/eaf3c413-37b0-4181-8852-f281338679df" />
 
 What changed:
 - **`services/bridge`** — thin MQTT→Kafka bridge (keys each message by nodeId, batches to Redpanda). Does almost no per-message work, so it is not a bottleneck.
